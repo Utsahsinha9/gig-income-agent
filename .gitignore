@@ -4,3 +4,5 @@ __pycache__/
 synthetic_gig_income.csv
 forecasts.csv
 
+
+.env
