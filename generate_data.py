@@ -2,16 +2,14 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 
-np.random.seed(42)  # reproducibility — same personas every run while we're testing
-
 def generate_persona(
     name: str,
     start_date: str,
     weeks: int,
     base_income: float,
-    volatility: float,      # std dev as a fraction of base_income
-    payout_frequency: float,  # avg payouts per week (irregular timing)
-    trend: float = 0.0,       # slight income growth/decline per week
+    volatility: float,
+    payout_frequency: float,
+    trend: float = 0.0,
 ):
     events = []
     current_date = datetime.strptime(start_date, "%Y-%m-%d")
@@ -40,22 +38,32 @@ def generate_persona(
     return pd.DataFrame(events)
 
 
-steady_delivery = generate_persona(
-    "steady_delivery_partner", "2025-01-01", weeks=26,
-    base_income=8000, volatility=0.15, payout_frequency=3, trend=0.0
-)
+def generate_all_personas(seed=42):
+    """
+    Generates all three personas under one random seed. Pulled out as
+    its own function (instead of script-level code) so multiseed_eval.py
+    can call this repeatedly with different seeds.
+    """
+    np.random.seed(seed)
 
-spiky_freelancer = generate_persona(
-    "spiky_freelancer", "2025-01-01", weeks=26,
-    base_income=12000, volatility=0.6, payout_frequency=1.2, trend=0.05
-)
+    steady_delivery = generate_persona(
+        "steady_delivery_partner", "2025-01-01", weeks=26,
+        base_income=8000, volatility=0.15, payout_frequency=3, trend=0.0
+    )
+    spiky_freelancer = generate_persona(
+        "spiky_freelancer", "2025-01-01", weeks=26,
+        base_income=12000, volatility=0.6, payout_frequency=1.2, trend=0.05
+    )
+    new_gig_worker = generate_persona(
+        "new_gig_worker", "2025-06-01", weeks=6,
+        base_income=6000, volatility=0.4, payout_frequency=1.5, trend=0.0
+    )
 
-new_gig_worker = generate_persona(
-    "new_gig_worker", "2025-06-01", weeks=6,
-    base_income=6000, volatility=0.4, payout_frequency=1.5, trend=0.0
-)
+    all_data = pd.concat([steady_delivery, spiky_freelancer, new_gig_worker])
+    return all_data.sort_values(["persona", "date"]).reset_index(drop=True)
 
-all_data = pd.concat([steady_delivery, spiky_freelancer, new_gig_worker])
-all_data = all_data.sort_values(["persona", "date"]).reset_index(drop=True)
-all_data.to_csv("synthetic_gig_income.csv", index=False)
-print(all_data.groupby("persona")["amount"].describe())
+
+if __name__ == "__main__":
+    all_data = generate_all_personas(seed=42)
+    all_data.to_csv("synthetic_gig_income.csv", index=False)
+    print(all_data.groupby("persona")["amount"].describe())
