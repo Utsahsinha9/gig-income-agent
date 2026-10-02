@@ -49,13 +49,44 @@ def forecast_persona(persona_df):
     return pd.DataFrame(results)
 
 
-# --- Multi-week horizon forecasting ---
-# Why: a single week's floor can hit ₹0 just from one unlucky
-# zero-payout week (pure Poisson noise), producing a useless
-# "never spend anything" recommendation. Real people naturally
-# smooth irregular income across a few weeks rather than resetting
-# every Monday — so we forecast a rolling HORIZON (e.g. the next
-# 2 weeks combined) instead of a single isolated week.
+# --- Parameterized single-week method — used by ablation_floor.py to
+# sweep the floor quantile instead of widening the horizon. ---
+
+def forecast_persona_param(persona_df, window=WINDOW, min_history=MIN_HISTORY,
+                             floor_q=0.10, typical_q=0.50, optimistic_q=0.90):
+    persona_df = persona_df.sort_values("week").reset_index(drop=True)
+    income = persona_df["weekly_income"]
+
+    results = []
+    for i in range(len(persona_df)):
+        history = income.iloc[max(0, i - window):i]
+
+        if len(history) < min_history:
+            floor = 0.0
+            typical = income.iloc[:i].mean() if i > 0 else 0.0
+            optimistic = income.iloc[:i].max() if i > 0 else 0.0
+            confident = False
+        else:
+            floor, typical, optimistic = np.percentile(
+                history, [floor_q * 100, typical_q * 100, optimistic_q * 100]
+            )
+            confident = True
+
+        results.append({
+            "week": persona_df["week"].iloc[i],
+            "actual": income.iloc[i],
+            "floor": floor,
+            "typical": typical,
+            "optimistic": optimistic,
+            "confident": confident,
+        })
+
+    return pd.DataFrame(results)
+
+
+# --- Multi-week horizon forecasting (kept for reference / comparison —
+# ablation showed this under-covers due to autocorrelated overlapping
+# blocks, so it's not the method we're moving forward with) ---
 
 HORIZON_WEEKS = 3
 
@@ -63,18 +94,14 @@ def forecast_persona_horizon(persona_df, horizon=HORIZON_WEEKS, window=WINDOW, m
     persona_df = persona_df.sort_values("week").reset_index(drop=True)
     income = persona_df["weekly_income"]
 
-    # trailing horizon-week sums: block_sums[i] = total income over
-    # the `horizon` weeks ending at week i (NaN until enough weeks exist)
     block_sums = income.rolling(window=horizon).sum()
 
     results = []
     for i in range(len(persona_df)):
         actual = block_sums.iloc[i]
         if pd.isna(actual):
-            continue  # not enough weeks yet to even form this block
+            continue
 
-        # history: past horizon-week block sums, using only blocks
-        # that ended strictly BEFORE this one started — no lookahead
         history_end = i - horizon
         history = block_sums.iloc[max(0, history_end - window + 1): history_end + 1].dropna()
 
