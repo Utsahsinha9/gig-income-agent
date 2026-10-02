@@ -16,6 +16,7 @@ weekly = (
 )
 
 # --- Step 2: rolling-window quantile forecast, walk-forward (single week) ---
+# This is the finalized method the project uses.
 QUANTILES = [0.1, 0.5, 0.9]
 WINDOW = 8
 MIN_HISTORY = 4
@@ -49,8 +50,11 @@ def forecast_persona(persona_df):
     return pd.DataFrame(results)
 
 
-# --- Parameterized single-week method — used by ablation_floor.py to
-# sweep the floor quantile instead of widening the horizon. ---
+# --- Parameterized version of the same method — used by ablation_floor.py
+# to sweep the floor quantile. Confirmed via ablation that no floor_q in
+# a reasonable range fixes the "honest zero floor" issue for volatile
+# personas, since the zero-mass in the data itself exceeds the quantile
+# range tested. Kept for reference / future ablation work. ---
 
 def forecast_persona_param(persona_df, window=WINDOW, min_history=MIN_HISTORY,
                              floor_q=0.10, typical_q=0.50, optimistic_q=0.90):
@@ -84,9 +88,11 @@ def forecast_persona_param(persona_df, window=WINDOW, min_history=MIN_HISTORY,
     return pd.DataFrame(results)
 
 
-# --- Multi-week horizon forecasting (kept for reference / comparison —
-# ablation showed this under-covers due to autocorrelated overlapping
-# blocks, so it's not the method we're moving forward with) ---
+# --- Multi-week horizon forecasting — NOT used in the final pipeline.
+# Ablation showed this under-covers badly (as low as 29%) because
+# summing overlapping rolling blocks makes consecutive "samples"
+# highly correlated, shrinking the effective sample size feeding the
+# quantile estimate. Kept here only as a documented dead end. ---
 
 HORIZON_WEEKS = 3
 
@@ -125,6 +131,41 @@ def forecast_persona_horizon(persona_df, horizon=HORIZON_WEEKS, window=WINDOW, m
         })
 
     return pd.DataFrame(results)
+
+
+# --- Naive baselines, for comparison ---
+# Why these two specifically: "last-value" and "flat-mean" are the
+# standard trivial baselines in forecasting — if our quantile method
+# can't beat these, it isn't earning its complexity.
+
+def naive_last_value_baseline(persona_df):
+    """Predicts this week = last week's actual. No band, just a point forecast."""
+    persona_df = persona_df.sort_values("week").reset_index(drop=True)
+    income = persona_df["weekly_income"]
+
+    predictions = income.shift(1)  # strictly uses only the prior week
+    return pd.DataFrame({
+        "week": persona_df["week"],
+        "actual": income,
+        "predicted": predictions,
+    }).dropna()
+
+
+def naive_mean_baseline(persona_df):
+    """Predicts this week = mean of all PRIOR weeks (expanding window)."""
+    persona_df = persona_df.sort_values("week").reset_index(drop=True)
+    income = persona_df["weekly_income"]
+
+    predictions = income.expanding().mean().shift(1)  # mean of weeks before this one
+    return pd.DataFrame({
+        "week": persona_df["week"],
+        "actual": income,
+        "predicted": predictions,
+    }).dropna()
+
+
+def mean_absolute_error(actual, predicted):
+    return np.abs(actual - predicted).mean()
 
 
 # --- Step 3: evaluation helpers ---
