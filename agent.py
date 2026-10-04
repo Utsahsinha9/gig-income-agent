@@ -3,11 +3,35 @@ from typing import TypedDict, Optional
 from dotenv import load_dotenv
 from groq import Groq
 from langgraph.graph import StateGraph, END
+import json
+from datetime import datetime, timezone
 
 import forecast
 
 load_dotenv()
 client = Groq(api_key=os.environ["GROQ_API_KEY"])
+DECISION_LOG_PATH = "decision_log.jsonl"
+
+def log_decision(state: dict):
+    """
+    Appends one record per agent run to a JSONL file — one JSON object
+    per line, so it's easy to append to and easy to read back (e.g.
+    pd.read_json(path, lines=True)). This is the project's audit trail:
+    every recommendation the agent ever made, with enough context to
+    explain why, after the fact.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "persona": state["persona"],
+        "question": state.get("question"),
+        "forecast": state["week_forecast"],
+        "confident": state["confident"],
+        "safe_to_spend": state["safe_to_spend"],
+        "buffer_amount": state["buffer_amount"],
+        "answer": state.get("answer"),
+    }
+    with open(DECISION_LOG_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 class AgentState(TypedDict):
@@ -106,8 +130,11 @@ def run_agent(persona: str, question: Optional[str] = None) -> dict:
     Callable entry point for the UI (or anything else) to use.
     Returns the full result dict — persona's forecast, safe-to-spend
     figures, confidence, and the LLM's answer if a question was asked.
+    Also appends a record of this decision to the decision log.
     """
-    return app.invoke({"persona": persona, "question": question})
+    result = app.invoke({"persona": persona, "question": question})
+    log_decision(result)
+    return result
 
 
 if __name__ == "__main__":

@@ -1,62 +1,148 @@
-import streamlit as st
-import pandas as pd
+import os
+import json
+from datetime import datetime, timezone
+from typing import TypedDict, Optional
+from dotenv import load_dotenv
+from groq import Groq
+from langgraph.graph import StateGraph, END
+
 import forecast
-from agent import run_agent
 
-st.set_page_config(page_title="Gig Income Budgeting Agent", layout="wide")
-st.title("Irregular-Income Budgeting Agent")
-st.caption("Forecasts safe-to-spend amounts for gig workers with volatile income — synthetic demo data")
+load_dotenv()
+client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-# --- Sidebar: persona picker ---
-df = pd.read_csv("synthetic_gig_income.csv", parse_dates=["date"])
-personas = sorted(df["persona"].unique())
-selected_persona = st.sidebar.selectbox("Choose a persona", personas)
+DECISION_LOG_PATH = "decision_log.jsonl"
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Personas:**\n"
-    "- `steady_delivery_partner`: low volatility, regular payouts\n"
-    "- `spiky_freelancer`: high volatility, irregular timing\n"
-    "- `new_gig_worker`: thin history (tests low-confidence fallback)"
-)
+def log_decision(state: dict):
+    """
+    Appends one record per agent run to a JSONL file — one JSON object
+    per line, so it's easy to append to and easy to read back (e.g.
+    pd.read_json(path, lines=True)). This is the project's audit trail:
+    every recommendation the agent ever made, with enough context to
+    explain why, after the fact.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "persona": state["persona"],
+        "question": state.get("question"),
+        "forecast": state["week_forecast"],
+        "confident": state["confident"],
+        "safe_to_spend": state["safe_to_spend"],
+        "buffer_amount": state["buffer_amount"],
+        "answer": state.get("answer"),
+    }
+    with open(DECISION_LOG_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
-# --- Main: run the agent for the selected persona ---
-with st.spinner("Computing forecast..."):
-    result = run_agent(selected_persona)  # no question yet — just the numbers
 
-# --- Income history chart ---
-st.subheader("Income History")
-persona_weekly = forecast.weekly_totals(
-    df[df["persona"] == selected_persona]
-).reset_index()
-persona_weekly.columns = ["week", "weekly_income"]
-st.line_chart(persona_weekly.set_index("week")["weekly_income"])
+class AgentState(TypedDict):
+    persona: str
+    question: Optional[str]
+    week_forecast: Optional[dict]
+    safe_to_spend: Optional[float]
+    safe_to_spend_weekly: Optional[float]
+    buffer_amount: Optional[float]
+    confident: Optional[bool]
+    answer: Optional[str]
 
-# --- Forecast band ---
-st.subheader(f"Forecast — Next {forecast.HORIZON_WEEKS} Weeks")
-col1, col2, col3 = st.columns(3)
-col1.metric("Floor (conservative)", f"₹{result['week_forecast']['floor']:,.0f}")
-col2.metric("Typical", f"₹{result['week_forecast']['typical']:,.0f}")
-col3.metric("Optimistic", f"₹{result['week_forecast']['optimistic']:,.0f}")
 
-if not result["confident"]:
-    st.warning(
-        "Low confidence — this persona doesn't have enough income history yet. "
-        "Showing a wider, more cautious estimate."
+def ingest_node(state: AgentState) -> AgentState:
+    df = forecast.pd.read_csv("synthetic_gig_income.csv", parse_dates=["date"])
+    weekly = forecast.weekly_totals(df[df["persona"] == state["persona"]]).reset_index()
+    weekly.columns = ["week", "weekly_income"]
+
+    fc = forecast.forecast_persona(weekly)
+    latest = fc.iloc[-1]
+
+    state["week_forecast"] = {
+        "floor": float(latest["floor"]),
+        "typical": float(latest["typical"]),
+        "optimistic": float(latest["optimistic"]),
+    }
+    state["confident"] = bool(latest["confident"])
+    return state
+
+
+def safe_to_spend_node(state: AgentState) -> AgentState:
+    floor = state["week_forecast"]["floor"]
+    typical = state["week_forecast"]["typical"]
+
+    # Blend floor and typical instead of relying on floor alone —
+    # floor can be honestly ₹0 for a volatile persona, which would
+    # otherwise zero out the whole recommendation.
+    if not state["confident"]:
+        safe_total = 0.5 * floor + 0.2 * typical
+        buffer_total = typical - safe_total if typical > safe_total else 0.0
+    else:
+        safe_total = 0.3 * floor + 0.4 * typical
+        buffer_total = typical - safe_total if typical > safe_total else 0.0
+
+    state["safe_to_spend"] = safe_total
+    state["buffer_amount"] = buffer_total
+    state["safe_to_spend_weekly"] = safe_total
+    return state
+
+
+def qa_node(state: AgentState) -> AgentState:
+    if not state.get("question"):
+        state["answer"] = None
+        return state
+
+    context = f"""
+You are a budgeting assistant for a gig worker with irregular income.
+This week's forecast: floor=₹{state['week_forecast']['floor']:.0f},
+typical=₹{state['week_forecast']['typical']:.0f},
+optimistic=₹{state['week_forecast']['optimistic']:.0f}.
+Recommended safe-to-spend this week: ₹{state['safe_to_spend']:.0f}.
+Recommended buffer to set aside: ₹{state['buffer_amount']:.0f}.
+Confidence: {"normal" if state['confident'] else "LOW — limited income history, being extra conservative"}.
+
+Answer the user's question using ONLY these numbers. Be direct and brief.
+If the question can't be answered from these numbers, say so honestly.
+"""
+
+    response = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {"role": "system", "content": context},
+            {"role": "user", "content": state["question"]},
+        ],
+        temperature=0.3,
     )
+    state["answer"] = response.choices[0].message.content
+    return state
 
-# --- Safe-to-spend recommendation ---
-st.subheader("Safe-to-Spend Recommendation")
-col1, col2 = st.columns(2)
-col1.metric(f"Safe to spend ({forecast.HORIZON_WEEKS} weeks)", f"₹{result['safe_to_spend']:,.0f}")
-col1.caption(f"≈ ₹{result['safe_to_spend_weekly']:,.0f}/week")
-col2.metric("Recommended buffer", f"₹{result['buffer_amount']:,.0f}")
 
-# --- Q&A chat ---
-st.subheader("Ask About Your Budget")
-question = st.text_input("e.g. \"Can I afford to spend ₹5000 this week?\"")
+graph = StateGraph(AgentState)
+graph.add_node("ingest", ingest_node)
+graph.add_node("safe_to_spend", safe_to_spend_node)
+graph.add_node("qa", qa_node)
 
-if st.button("Ask") and question:
-    with st.spinner("Thinking..."):
-        qa_result = run_agent(selected_persona, question=question)
-    st.markdown(f"**Answer:** {qa_result['answer']}")
+graph.set_entry_point("ingest")
+graph.add_edge("ingest", "safe_to_spend")
+graph.add_edge("safe_to_spend", "qa")
+graph.add_edge("qa", END)
+
+app = graph.compile()
+
+
+def run_agent(persona: str, question: Optional[str] = None) -> dict:
+    """
+    Callable entry point for the UI (or anything else) to use.
+    Returns the full result dict — persona's forecast, safe-to-spend
+    figures, confidence, and the LLM's answer if a question was asked.
+    Also appends a record of this decision to the decision log.
+    """
+    result = app.invoke({"persona": persona, "question": question})
+    log_decision(result)
+    return result
+
+
+if __name__ == "__main__":
+    result = run_agent("spiky_freelancer", "Can I afford to spend ₹5000 this week?")
+
+    print("\nForecast:", result["week_forecast"])
+    print("Confident:", result["confident"])
+    print("Safe to spend (weekly):", round(result["safe_to_spend"]))
+    print("Buffer:", round(result["buffer_amount"]))
+    print("\nAnswer:", result["answer"])
